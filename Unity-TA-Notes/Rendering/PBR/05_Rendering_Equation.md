@@ -57,7 +57,7 @@ $$L_{specular}\approx prefilteredEnv(R,r)\,[F_0 A(NoV,r)+B(NoV,r)]$$
 
 `DFG LUT` 是行业里对环境 BRDF 预积分表的常见叫法；它与 [03 中直接光的三个因子 D、F、G](03_Cook_Torrance_DFG.md) 有联系，但不是三个独立贴图通道。进一步阅读：[Filament 的 IBL 章节](https://google.github.io/filament/main/filament.html#lighting/imagebasedlights)。
 
-## 从积分到采样
+## 补充：从积分到采样
 
 若按概率密度 `p(L)` 采样半球，蒙特卡洛估计为：
 
@@ -74,3 +74,34 @@ $$L_o-L_e\approx\frac{1}{M}\sum_{i=1}^{M}\frac{f_r(L_i,V)L_i(L_i)(N\cdot L_i)}{p
 ```
 
 配套 HLSL 只实现第一行中的两个直接光分量。为了观察公式，它不自动补环境亮度，也不输出已经 Gamma 编码的颜色。
+
+## 将公式安排到执行流程
+
+| 频率 | 计算内容 |
+| --- | --- |
+| 每顶点 | 位置、法线和切线空间变换，准备插值数据 |
+| 每片元、灯循环之前 | 采材质贴图，构建 N，计算 V，以及可预计算的 alpha/F0 |
+| 每盏灯 | 读取 L 与光色/衰减，计算 H、D/F/G，得到该灯贡献 |
+| 灯循环之后 | 加间接光与自发光，应用雾和后续输出处理 |
+
+教育函数库为了保持单光源接口独立，会在函数内重复做归一化和材质转换。优化时可以将这些共享数据提出灯循环，但应保持计算语义一致。
+
+多灯求和不能先把光方向相加再计算 BRDF，因为高光对方向的响应是非线性的；应对每个方向分别求值，再相加颜色。
+
+## 附：直接光求和代码
+
+下面假设材质、N、V 与两个 Light 已准备好，完整接口见 06：
+
+```hlsl
+float3 direct = float3(0, 0, 0);
+direct += CPBR_EvaluateDirect(material, N, V, light0.direction,
+    light0.color, light0.distanceAttenuation, light0.shadowAttenuation);
+direct += CPBR_EvaluateDirect(material, N, V, light1.direction,
+    light1.color, light1.distanceAttenuation, light1.shadowAttenuation);
+```
+
+每次调用已经乘过 NoL、距离衰减和阴影，不要在求和后再乘一次。也不要除以灯光数量；额外光源本来就应该增加照明。
+
+例如 03 的正视条件下，一盏单位白光每通道约贡献 0.356507，两盏相同方向的单位白光就约为 0.713014。
+
+自发光只在求和后加入一次。线性 HDR 可以大于 1，不应在光照函数末尾直接 `saturate(color)`，否则会截掉曝光和色调映射需要的信息。

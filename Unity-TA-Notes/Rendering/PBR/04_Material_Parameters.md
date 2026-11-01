@@ -30,11 +30,7 @@
 
 本笔记对输入先做：
 
-```text
-r = clamp(perceptualRoughness, 0.045, 1)
-alpha = r * r
-alpha2 = alpha * alpha
-```
+$$r=\operatorname{clamp}(r_{input},0.045,1),\quad \alpha=r^2,\quad \alpha^2=r^4$$
 
 下限 `0.045` 是本教育实现的数值选择，不是所有 Unity Shader 的统一规则。URP 也有自己的精度下限与优化项，应按本地版本检查。
 
@@ -55,19 +51,45 @@ ORM（R=AO、G=Roughness、B=Metallic）是另一种常见打包约定，不等�
 
 ## 法线接线
 
-切线空间法线需要通过 TBN 转到世界空间，再与世界空间 L、V 点乘。处理好模型切线的符号、负缩放和插值后的归一化。最小示例只使用网格法线，便于先验证 DFG。
+切线空间法线需要通过 TBN 转到世界空间，再与世界空间 L、V 点乘。处理好模型切线的符号、负缩放和插值后的归一化。06 的完整示例已包含这条接线；使用默认平坦法线时，结果接近原来的网格法线。
 
 ## AO 的位置
 
 AO 主要近似未解析几何对间接光的遮挡，不应不加区分地把所有直接高光乘暗。镜面环境遮蔽也通常需要不同处理。配套直接光函数不接收 AO；未来加入间接光后再按光照分量应用。
 
-## 调参练习
-
-固定曝光、相机和灯光，在同一材质球上只改一个参数：
-
-1. `m=0`，从 `r=0.1` 改到 `r=0.9`，观察高光形状。
-2. 固定 Base Color 和 r，将 `m=0` 改为 `m=1`，观察漫反射消失与高光着色。
-3. 旋转光源，确认高光移动正确，再加入 Normal Map。
-4. 最后添加环境反射；纯金属在缺少直接高光和环境反射时很暗是可预期的。
-
 Unity 参数初始化可对照 [URP BRDF.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.universal/ShaderLibrary/BRDF.hlsl)。本例的角度相关漫反射权重与该源码不完全相同。
+
+## 材质参数如何共同进入 BRDF
+
+将颜色记为 C，金属度记为 m：
+
+$$F_0=(1-m)\,0.04+mC$$
+
+$$k_D=(1-F)(1-m),\qquad f_d=k_D\frac{C}{\pi}$$
+
+第一条式子决定镜面反射的基础颜色，第二条式子决定漫反射保留多少。因此 Metallic 不是独立的亮度滑条，而是同时改变镜面参数与漫反射分配。
+
+当 m=0 时，F0 为无色的 0.04，C 主要提供漫反射颜色；当 m=1 时，F0=C，而漫反射为零。中间值是工作流中的混合近似，不应解释成材质有某个百分比的导电率。
+
+Normal Map 影响的是 N，由此改变 NoL、NoV、NoH；Roughness 通过 alpha 改变 D 和 G。两者都能让高光变得复杂，但不是同一条控制路径。
+
+## 附：从贴图生成参数的代码
+
+以下片段位于片元函数中。假设纹理、采样器和 uv 已声明；完整声明见 [06](06_Unity_URP_Implementation.md)。本例采用 ORM：R=AO、G=感知粗糙度、B=金属度。
+
+```hlsl
+float3 sampledBase = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uv).rgb;
+float3 orm = SAMPLE_TEXTURE2D(_ORMMap, sampler_ORMMap, uv).rgb;
+
+CPBR_Material material;
+material.baseColor = sampledBase * _BaseColor.rgb;
+material.metallic = saturate(orm.b * _Metallic);
+material.perceptualRoughness = clamp(orm.g * _Roughness, 0.045, 1.0);
+// orm.r 留给间接光遮蔽；当前示例只实现直接光。
+```
+
+这里的面板参数是乘法系数：例如 G 通道为 0.4，粗糙度系数为 0.5，最终 r=0.2。要使用贴图原值，系数设为 1；用默认白图时，滑条直接决定参数。
+
+若输入是 Smoothness，应先用 `r=1-smoothness` 转换，再交给函数库。不要同时在贴图读取处与 `CPBR_RoughnessToAlpha` 中将 r 平方。
+
+颜色纹理采样为线性值后再参与光照；ORM 不作 sRGB 解码。存储值 0.5 若被按 sRGB 解码，大约会变成 0.214，用在粗糙度上会明显改变 D/G 的输入。

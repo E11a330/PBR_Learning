@@ -39,14 +39,8 @@ $$
 
 $$\int_{\Omega^+}D(H)(N\cdot H)\,d\omega_H=1$$
 
-因此 `D` 不是「0～1 的概率」。代码使用等价分母，减轻 `NoH≈1` 时的消减误差：
+因此 `D` 不是「0～1 的概率」。代码将分母中的括号记为 d，并改写成 `d=(1-NoH²)+NoH²*alpha²`。两者代数等价，后者可减轻 `NoH≈1` 时的消减误差。
 
-```hlsl
-float alpha2 = alpha * alpha;
-float NoH2 = NoH * NoH;
-float d = (1.0 - NoH2) + NoH2 * alpha2;
-float D = alpha2 / (CPBR_PI * d * d);
-```
 
 配套实现将 `r` 限制到 `[0.045,1]`，避免完美镜面极限。**不要**再把 `d*d` 粗暴夹到 `1e-4`，否则低粗糙度高光会被压坏。精确镜面需要 delta 分布处理，不靠将粗糙度设为 0 实现。
 
@@ -66,14 +60,8 @@ $$F_0=\left(\frac{\eta-1}{\eta+1}\right)^2$$
 
 例如 `η=1.5 → F0=0.04`。金属涉及复折射率，本代码用 RGB F0 作近似，并不求解完整导体 Fresnel。
 
-实现五次方可以避免通用 `pow`：
+实现中用连乘得到五次方，最后的代码会对应这一项。
 
-```hlsl
-float x = 1.0 - VoH;
-float x2 = x * x;
-float x5 = x2 * x2 * x;
-float3 F = F0 + (1.0 - F0) * x5;
-```
 
 直接微表面镜面项使用 `VoH`。IBL 的近似或查表常以 `NoV` 为输入，那是经过方向积分后的另一层问题。
 
@@ -151,13 +139,104 @@ fd + fs = 1.12/pi ≈ 0.356507
 
 灯光和两种衰减均为 1 时，直接光输出每通道约 `0.356507`。这只是单方向检查，不是半球能量积分。
 
-## 写代码时的检查清单
+## 9. 方向与粗糙度如何改变结果
 
-- 先统一 `r / α / α²`，再抄公式。
-- N、L、V 同空间归一化，拒绝背面和退化方向。
-- F 使用 `VoH`；D 使用 `NoH`；G/V 使用 `NoL` 与 `NoV`。
-- `D*F*Vsmith` 与 `D*F*G/(4*NoL*NoV)` 二选一。
-- 在单光源组合时乘一次 `NoL`，不要遗漏或重复。
-- 公式中间量保留 `float`；结果不要 `saturate`，让后处理处理 HDR。
+固定 `N=V=(0,0,1)`，让 L 与 N 的夹角 θ 变化；白色非金属 `baseColor=1`、`r=0.5`，灯色与衰减均为 1。下表每个值都是线性值：
 
-[对应 HLSL](Shaders/CustomPBR.hlsl) · [接入 URP](06_Unity_URP_Implementation.md)
+| θ | NoL | NoH = VoH | D | F | G | visibility | 单通道直接光 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0° | 1.000000 | 1.000000 | 5.092958 | 0.040000 | 1.000000 | 0.250000 | 0.356507 |
+| 30° | 0.866025 | 0.965926 | 1.267138 | 0.040000 | 0.994845 | 0.287187 | 0.277244 |
+| 60° | 0.500000 | 0.866025 | 0.225727 | 0.040041 | 0.957064 | 0.478532 | 0.154945 |
+| 80° | 0.173648 | 0.766044 | 0.098308 | 0.040673 | 0.731262 | 1.052793 | 0.053757 |
+
+如何读这张表：光源转离正面后，H 也离开 N，高光中心的 D 明显下降；NoL 又减小，所以直接光整体变暗。F 在这组方向中并没有接近 1，因为微表面入射角由 VoH 决定，不能把宏观 NoL 很小直接等同于 Fresnel 必然接近 1。
+
+还可以看到 visibility 在 80° 时大于 1，但 G 仍小于 1。原因是 visibility 已除以 `4 NoL NoV`；把它误认成「应在 0～1 之间的 G」再夹到 1，会改变模型。
+
+固定 `N=L=V`，只改变粗糙度则有：
+
+$$D(NoH=1)=\frac{1}{\pi\alpha^2}=\frac{1}{\pi r^4}$$
+
+`r=0.5` 时峰值约 `5.093`；`r=0.25` 时峰值约 `81.487`，提升 16 倍。这说明低粗糙度需要足够精度，也说明高光峰值不能直接用 `saturate(D)` 截掉。峰值更高并不意味着半球总能量按同样比例增加。
+
+## 10. 公式与代码的对应
+
+| 公式中的量 | 源码变量 / 函数 | 什么时候计算 |
+| --- | --- | --- |
+| r | `material.perceptualRoughness` | 材质采样后 |
+| α | `CPBR_RoughnessToAlpha(r)` | 本可每片元一次；教学库为独立接口在调用内计算 |
+| F0 | `CPBR_F0(baseColor, metallic)` | 与灯无关 |
+| H | `CPBR_SafeNormalize(V + L)` | 每盏灯不同 |
+| D | `CPBR_DistributionGGX(NoH, alpha)` | 每盏灯求值 |
+| F | `CPBR_FresnelSchlick(VoH, F0)` | 每盏灯求值 |
+| G/(4 NoL NoV) | `CPBR_VisibilitySmithGGXCorrelated(...)` | 每盏灯求值 |
+| fr | `diffuseBRDF + specularBRDF` | 尚未乘光源 |
+| 单灯积分贡献 | `CPBR_EvaluateDirect(...)` | 已乘 NoL、光色和衰减 |
+
+后续要优化性能，可以把 α、F0 等与光无关的量移出灯光循环。但第一次实现时，优先保留函数边界，方便逐项检查。
+
+## 11. 容易混淆的几组概念
+
+| 概念 | 区别与代码影响 |
+| --- | --- |
+| D 与最终高光 | D 只描述方向分布，还要乘 F、G/V 与灯光 |
+| G 与场景阴影 | G 是微表面遮蔽；Shadow Map 描述其他几何挡光 |
+| G 与 visibility | 后者已除以 `4 NoL NoV`，不可重复除分母 |
+| NoV 与 VoH | 直接微表面 Fresnel 用 VoH；IBL 拟合常以 NoV 为输入 |
+| 粗糙度 r 与 alpha | 本文 alpha=r²；函数参数名必须看具体约定 |
+| BRDF 与单灯颜色 | 后者还要乘光色、NoL、距离衰减和场景可见性 |
+
+## 12. 对应 HLSL 实现
+
+函数库将基础公式分别封装为 D、F、visibility 函数，再组合为 BRDF 和单灯贡献。下面将调用过程展开，便于对照前面的公式；它依赖 [CustomPBR.hlsl](Shaders/CustomPBR.hlsl) 的基础函数。
+
+```hlsl
+float3 ExplainDirectPBR(
+    CPBR_Material material,
+    float3 normalWS, float3 viewDirWS, float3 lightDirWS,
+    float3 lightColor, float distanceAttenuation, float shadowAttenuation)
+{
+    // 第 1 步：拒绝无方向的输入，再统一为单位向量。
+    if (dot(normalWS, normalWS) < 1e-12 || dot(viewDirWS, viewDirWS) < 1e-12
+        || dot(lightDirWS, lightDirWS) < 1e-12)
+        return float3(0, 0, 0);
+    float3 N = CPBR_SafeNormalize(normalWS);
+    float3 V = CPBR_SafeNormalize(viewDirWS);
+    float3 L = CPBR_SafeNormalize(lightDirWS);
+
+    // 第 2 步：将方向变成公式使用的余弦值。
+    float NoL = saturate(dot(N, L));
+    float NoV = saturate(dot(N, V));
+    if (NoL <= 0.0 || NoV <= 0.0)
+        return float3(0, 0, 0);
+    float3 sumVL = V + L;
+    if (dot(sumVL, sumVL) < 1e-12)
+        return float3(0, 0, 0);
+    float3 H = CPBR_SafeNormalize(sumVL);
+    float NoH = saturate(dot(N, H));
+    float VoH = saturate(dot(V, H));
+
+    // 第 3 步：将美术参数转成 BRDF 参数。
+    float3 baseColor = saturate(material.baseColor);
+    float metallic = saturate(material.metallic);
+    float alpha = CPBR_RoughnessToAlpha(material.perceptualRoughness);
+    float3 F0 = CPBR_F0(baseColor, metallic);
+
+    // 第 4 步：代入 D、F、G 的实现。本例用已合并分母的 visibility。
+    float D = CPBR_DistributionGGX(NoH, alpha);
+    float3 F = CPBR_FresnelSchlick(VoH, F0);
+    float visibility = CPBR_VisibilitySmithGGXCorrelated(NoL, NoV, alpha);
+    float3 specularBRDF = D * F * visibility;
+
+    // 第 5 步：给漫反射分配剩余能量，并排除纯金属漫反射。
+    float3 kD = (1.0 - F) * (1.0 - metallic);
+    float3 diffuseBRDF = kD * baseColor / CPBR_PI;
+
+    // 第 6 步：从材质响应变成这盏灯的颜色贡献。
+    float attenuation = max(distanceAttenuation, 0.0) * saturate(shadowAttenuation);
+    return (diffuseBRDF + specularBRDF) * max(lightColor, 0.0) * NoL * attenuation;
+}
+```
+
+一般接入直接调用 `CPBR_EvaluateDirect`。如果要修改 D/F/G 的数学表达式，修改对应基础函数；如果要接灯光、贴图或改变坐标空间，查看 [06 的完整 Shader](06_Unity_URP_Implementation.md)。
