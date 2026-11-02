@@ -93,3 +93,39 @@ $$F_{D90}=0.5+2r(LoH)^2$$
 GGX 的 D 与相应 G、IBL 预过滤和积分近似需要匹配。替换 D 后保留所有其他计算，并不自动得到自洽的新模型。
 
 本笔记固定使用 Lambert + GGX 微表面镜面反射，后续代码围绕这一组合展开。这样可以先完整理解一套模型，再有依据地比较和替换。
+
+
+## 附：Lambert 与 Burley 的手写函数
+
+以下代码独立实现上文两个漫反射公式，只返回 BRDF，不乘灯色、外层 NoL 或场景阴影。`diffuseReflectance` 为已确定的漫反射颜色；若与镜面项组合，仍要按所选模型处理能量分配。Burley 是对照模型，完整 URP 示例继续使用 Lambert。
+
+```hlsl
+float3 NotesLambert(float3 diffuseReflectance)
+{
+    const float PI = 3.14159265358979323846;
+    return saturate(diffuseReflectance) / PI;
+}
+
+float3 NotesBurley(float3 diffuseReflectance, float NoL, float NoV, float LoH, float roughness)
+{
+    const float PI = 3.14159265358979323846;
+    NoL = saturate(NoL);
+    NoV = saturate(NoV);
+    LoH = saturate(LoH);
+    if (NoL <= 0.0 || NoV <= 0.0)
+        return float3(0, 0, 0);
+    float r = saturate(roughness);
+    float FD90 = 0.5 + 2.0 * r * LoH * LoH;
+    float xL = 1.0 - NoL;
+    float xV = 1.0 - NoV;
+    float xL2 = xL * xL;
+    float xV2 = xV * xV;
+    float xL5 = xL2 * xL2 * xL;
+    float xV5 = xV2 * xV2 * xV;
+    float incomingFactor = 1.0 + (FD90 - 1.0) * xL5;
+    float outgoingFactor = 1.0 + (FD90 - 1.0) * xV5;
+    return saturate(diffuseReflectance) * incomingFactor * outgoingFactor / PI;
+}
+```
+
+这里直接展开五次方与两个角度因子，没有隐藏的漫反射辅助函数。若只将其中一个模型替换到现有 Shader，应同时检查原有的 Fresnel 权重与能量修正，不能将两套权重无条件叠加。

@@ -106,7 +106,7 @@ $$f_s=D\,F\,V_{Smith}$$
 
 为避免极端掠射下分母接近零，V 的实现给分母加下限 `1e-7`；这是数值保护，会影响极端角度的精确值。进入函数前仍须拒绝 `NoL≤0` 或 `NoV≤0`。
 
-调试用的 G 函数由同一套受保护的 V 乘回 `4 NoL NoV` 得到。因此当分母下限生效时，它也继承了这项近似，并不是未加保护的解析 G；常规角度下两者一致。
+下面的 G 函数独立实现 `G=2*NoL*NoV/q`，其中 q 就是上式 V 的分母。G 与 V 都对 q 使用同一数值下限，因此在保护生效的极端角度也采用同一近似；常规角度下与 Lambda 形式等价。
 
 ## 6. Schlick–GGX 的 k 是另一种近似
 
@@ -190,9 +190,176 @@ $$D(NoH=1)=\frac{1}{\pi\alpha^2}=\frac{1}{\pi r^4}$$
 | 粗糙度 r 与 alpha | 本文 alpha=r²；函数参数名必须看具体约定 |
 | BRDF 与单灯颜色 | 后者还要乘光色、NoL、距离衰减和场景可见性 |
 
-## 12. 对应 HLSL 实现
+## 12. 对应 HLSL：把每个函数实现出来
 
-函数库将基础公式分别封装为 D、F、visibility 函数，再组合为 BRDF 和单灯贡献。下面将调用过程展开，便于对照前面的公式；它依赖 [CustomPBR.hlsl](Shaders/CustomPBR.hlsl) 的基础函数。
+前面是公式，下面直接给出完整函数体。`CPBR_` 是本笔记自写函数的前缀，不是 Unity 内置 BRDF；它们的定义全部在本节可见。
+
+### 12.1 D、F、G 和组合函数的完整实现
+
+阅读时先找三个函数：`CPBR_DistributionGGX` 的分子分母对应 D，`CPBR_FresnelSchlick` 的五次方对应 F，`CPBR_GeometrySmithGGXCorrelated` 的两个根号与几何分母对应 G。G 的独立实现没有调用 V 再反推。
+
+`CPBR_VisibilitySmithGGXCorrelated` 是同一个 G 与分母合并后的实现；它与 G 是可选的两种求值形式。组合函数使用 V 的形式，避免极端角度下先乘除很小的量。
+
+这段代码就是 `Shaders/CustomPBR.hlsl` 的完整内容，仅依赖 `dot/sqrt/rsqrt/saturate` 等 HLSL 基础指令。后半段调用的所有自写函数，都已经在前半段定义。
+
+```hlsl
+// 手写实现：下方依次给出参数转换、D、F、G、visibility、BRDF 与单灯组合的完整函数体。
+// 所有颜色按线性 RGB 计算；这里使用 GGX D + Schlick F + 高度相关 Smith G。
+// 本文件不依赖 Unity 头文件；完整接线见 ../06_Unity_URP_Implementation.md。
+// 阅读顺序：材质参数 → alpha/F0 → 几何点乘 → D/F/visibility → BRDF → 单灯贡献。
+// 03 中 ExplainDirectPBR 将下面的函数逐步展开；06 负责接入 Unity 几何与灯光。
+#ifndef UNITY_TA_NOTES_CUSTOM_PBR_INCLUDED
+#define UNITY_TA_NOTES_CUSTOM_PBR_INCLUDED
+
+static const float CPBR_PI = 3.14159265358979323846;
+static const float CPBR_MIN_ROUGHNESS = 0.045;
+static const float CPBR_VISIBILITY_EPSILON = 1e-7;
+
+struct CPBR_Material
+{
+    float3 baseColor;             // 线性颜色，在函数内夹到 [0,1]。
+    float metallic;               // 0=非金属，1=金属。
+    float perceptualRoughness;    // 面板上的粗糙度 r；不要预先平方。
+};
+
+float3 CPBR_SafeNormalize(float3 value)
+{
+    // 防止零向量归一化出错；光照入口还会拒绝无效方向。
+    return value * rsqrt(max(dot(value, value), 1e-12));
+}
+
+float CPBR_RoughnessToAlpha(float perceptualRoughness)
+{
+    // 面板/纹理存储 r；D 与 G/V 接收 alpha=r²，内部才计算 alpha²。
+    float r = clamp(perceptualRoughness, CPBR_MIN_ROUGHNESS, 1.0);
+    return r * r;
+}
+
+float3 CPBR_F0(float3 baseColor, float metallic)
+{
+    float3 color = saturate(baseColor);
+    float m = saturate(metallic);
+    // F0=(1-m)*0.04+m*baseColor，每个颜色通道独立计算。
+    return (1.0 - m) * float3(0.04, 0.04, 0.04) + m * color;
+}
+
+float CPBR_DistributionGGX(float NoH, float alpha)
+{
+    // D：法线分布密度。它可以大于 1，不要 saturate 返回值。
+    NoH = saturate(NoH);
+    alpha = clamp(alpha, CPBR_MIN_ROUGHNESS * CPBR_MIN_ROUGHNESS, 1.0);
+    float alpha2 = alpha * alpha;
+    float NoH2 = NoH * NoH;
+    // 与常见 GGX 分母等价，NoH 接近 1 时减少精度损失。
+    float d = (1.0 - NoH2) + NoH2 * alpha2;
+    return alpha2 / (CPBR_PI * d * d);
+}
+
+float3 CPBR_FresnelSchlick(float VoH, float3 F0)
+{
+    // F：直接微表面反射使用 V·H；F0 与返回值均是 RGB。
+    float x = 1.0 - saturate(VoH);
+    float x2 = x * x;
+    float x5 = x2 * x2 * x;
+    // F=F0+(1-F0)*(1-VoH)^5。
+    return F0 + (1.0 - F0) * x5;
+}
+
+float CPBR_VisibilitySmithGGXCorrelated(float NoL, float NoV, float alpha)
+{
+    // visibility 已包含 Cook–Torrance 分母；与纯 G 的数值范围不同。
+    NoL = saturate(NoL);
+    NoV = saturate(NoV);
+    if (NoL <= 0.0 || NoV <= 0.0)
+        return 0.0;
+
+    alpha = clamp(alpha, CPBR_MIN_ROUGHNESS * CPBR_MIN_ROUGHNESS, 1.0);
+    float alpha2 = alpha * alpha;
+    float lambdaV = NoL * sqrt(NoV * NoV * (1.0 - alpha2) + alpha2);
+    float lambdaL = NoV * sqrt(NoL * NoL * (1.0 - alpha2) + alpha2);
+    // 返回 G/(4*NoL*NoV)，不是纯 G；极小分母下限会影响极端掠射值。
+    return 0.5 / max(lambdaV + lambdaL, CPBR_VISIBILITY_EPSILON);
+}
+
+float CPBR_GeometrySmithGGXCorrelated(float NoL, float NoV, float alpha)
+{
+    // 独立实现 G，不通过调用 visibility 再反推。
+    NoL = saturate(NoL);
+    NoV = saturate(NoV);
+    if (NoL <= 0.0 || NoV <= 0.0)
+        return 0.0;
+    alpha = clamp(alpha, CPBR_MIN_ROUGHNESS * CPBR_MIN_ROUGHNESS, 1.0);
+    float alpha2 = alpha * alpha;
+    float rootV = sqrt(NoV * NoV * (1.0 - alpha2) + alpha2);
+    float rootL = sqrt(NoL * NoL * (1.0 - alpha2) + alpha2);
+    float denominator = NoL * rootV + NoV * rootL;
+    // G=2*NoL*NoV/denominator，等价于高度相关 Smith 的 Lambda 形式。
+    // 与 visibility 使用同一分母下限，使两种组合在极端角度保持同一近似。
+    return (2.0 * NoL * NoV) / max(denominator, CPBR_VISIBILITY_EPSILON);
+}
+
+void CPBR_EvaluateBRDF(
+    CPBR_Material material, float3 normal, float3 viewDir, float3 lightDir,
+    out float3 diffuseBRDF, out float3 specularBRDF)
+{
+    // 这一层只返回材质 BRDF，不乘当前灯光、阴影或外层 NoL。
+    diffuseBRDF = float3(0.0, 0.0, 0.0);
+    specularBRDF = float3(0.0, 0.0, 0.0);
+    if (dot(normal, normal) < 1e-12 || dot(viewDir, viewDir) < 1e-12
+        || dot(lightDir, lightDir) < 1e-12)
+        return;
+
+    // 三个方向必须在同一空间。本例接线统一用世界空间。
+    float3 N = CPBR_SafeNormalize(normal);
+    float3 V = CPBR_SafeNormalize(viewDir);   // 表面 → 相机。
+    float3 L = CPBR_SafeNormalize(lightDir);  // 表面 → 光源。
+    float NoL = saturate(dot(N, L));
+    float NoV = saturate(dot(N, V));
+    if (NoL <= 0.0 || NoV <= 0.0)
+        return;
+
+    float3 halfVector = V + L;
+    if (dot(halfVector, halfVector) < 1e-12)
+        return;
+    float3 H = CPBR_SafeNormalize(halfVector);
+    float NoH = saturate(dot(N, H));
+    float VoH = saturate(dot(V, H));
+    float3 baseColor = saturate(material.baseColor);
+    float metallic = saturate(material.metallic);
+    float alpha = CPBR_RoughnessToAlpha(material.perceptualRoughness);
+    float3 F = CPBR_FresnelSchlick(VoH, CPBR_F0(baseColor, metallic));
+    float D = CPBR_DistributionGGX(NoH, alpha);
+    float visibility = CPBR_VisibilitySmithGGXCorrelated(NoL, NoV, alpha);
+
+    specularBRDF = D * F * visibility; // 不要再除一次 4*NoL*NoV。
+    float3 kD = (1.0 - F) * (1.0 - metallic);
+    diffuseBRDF = kD * baseColor / CPBR_PI;
+    // 这是便于学习的能量分配近似，没有补微表面多次反射损失。
+}
+
+float3 CPBR_EvaluateDirect(
+    CPBR_Material material, float3 normal, float3 viewDir, float3 lightDir,
+    float3 lightColor, float distanceAttenuation, float shadowAttenuation)
+{
+    // 这一层应用渲染方程：对单盏灯乘光色、NoL 与场景衰减。
+    float3 diffuseBRDF;
+    float3 specularBRDF;
+    CPBR_EvaluateBRDF(material, normal, viewDir, lightDir, diffuseBRDF, specularBRDF);
+    float NoL = saturate(dot(CPBR_SafeNormalize(normal), CPBR_SafeNormalize(lightDir)));
+    // 近处点光源的衰减值可能大于 1；只夹负值，不要 saturate。
+    float attenuation = max(distanceAttenuation, 0.0) * saturate(shadowAttenuation);
+    return (diffuseBRDF + specularBRDF) * max(lightColor, 0.0) * NoL * attenuation;
+    // 返回线性 HDR。AO、环境反射、自发光和显示处理不在这里做。
+}
+
+#endif // UNITY_TA_NOTES_CUSTOM_PBR_INCLUDED
+```
+
+### 12.2 完全展开的单光源计算
+
+下面进一步把参数转换、D、F、相关 Smith、Lambert 和单灯组合直接写进函数体。它不调用前面的 BRDF 辅助函数，只使用上面已经定义的 `CPBR_Material` 数据结构；数学指令均为 HLSL 内置指令。
+
+这里的 `0.5/q` 是从 `G/(4NoLNoV)` 代数约简得到的，G 的完整独立函数已在 12.1 给出。若需要单独显示 G，使用它的函数体计算即可；正式镜面项不再重复乘 G 或重复除分母。
 
 ```hlsl
 float3 ExplainDirectPBR(
@@ -200,46 +367,63 @@ float3 ExplainDirectPBR(
     float3 normalWS, float3 viewDirWS, float3 lightDirWS,
     float3 lightColor, float distanceAttenuation, float shadowAttenuation)
 {
-    // 第 1 步：拒绝无方向的输入，再统一为单位向量。
-    if (dot(normalWS, normalWS) < 1e-12 || dot(viewDirWS, viewDirWS) < 1e-12
-        || dot(lightDirWS, lightDirWS) < 1e-12)
+    // 1. 方向检查和归一化：这里只用 HLSL 数学指令。
+    float n2 = dot(normalWS, normalWS);
+    float v2 = dot(viewDirWS, viewDirWS);
+    float l2 = dot(lightDirWS, lightDirWS);
+    if (n2 < 1e-12 || v2 < 1e-12 || l2 < 1e-12)
         return float3(0, 0, 0);
-    float3 N = CPBR_SafeNormalize(normalWS);
-    float3 V = CPBR_SafeNormalize(viewDirWS);
-    float3 L = CPBR_SafeNormalize(lightDirWS);
-
-    // 第 2 步：将方向变成公式使用的余弦值。
+    float3 N = normalWS * rsqrt(max(n2, 1e-12));
+    float3 V = viewDirWS * rsqrt(max(v2, 1e-12));
+    float3 L = lightDirWS * rsqrt(max(l2, 1e-12));
     float NoL = saturate(dot(N, L));
     float NoV = saturate(dot(N, V));
     if (NoL <= 0.0 || NoV <= 0.0)
         return float3(0, 0, 0);
     float3 sumVL = V + L;
-    if (dot(sumVL, sumVL) < 1e-12)
+    float h2 = dot(sumVL, sumVL);
+    if (h2 < 1e-12)
         return float3(0, 0, 0);
-    float3 H = CPBR_SafeNormalize(sumVL);
+    float3 H = sumVL * rsqrt(max(h2, 1e-12));
     float NoH = saturate(dot(N, H));
     float VoH = saturate(dot(V, H));
 
-    // 第 3 步：将美术参数转成 BRDF 参数。
+    // 2. 材质参数：感知粗糙度 r → alpha=r²，金属度 → RGB F0。
+    const float PI = 3.14159265358979323846;
     float3 baseColor = saturate(material.baseColor);
     float metallic = saturate(material.metallic);
-    float alpha = CPBR_RoughnessToAlpha(material.perceptualRoughness);
-    float3 F0 = CPBR_F0(baseColor, metallic);
+    float r = clamp(material.perceptualRoughness, 0.045, 1.0);
+    float alpha = r * r;
+    float alpha2 = alpha * alpha;
+    float3 F0 = (1.0 - metallic) * float3(0.04, 0.04, 0.04) + metallic * baseColor;
 
-    // 第 4 步：代入 D、F、G 的实现。本例用已合并分母的 visibility。
-    float D = CPBR_DistributionGGX(NoH, alpha);
-    float3 F = CPBR_FresnelSchlick(VoH, F0);
-    float visibility = CPBR_VisibilitySmithGGXCorrelated(NoL, NoV, alpha);
+    // 3. D：GGX 分布，完整写出分子和分母。
+    float NoH2 = NoH * NoH;
+    float d = (1.0 - NoH2) + NoH2 * alpha2;
+    float D = alpha2 / (PI * d * d);
+
+    // 4. F：Schlick，手工计算 (1-VoH)^5。
+    float oneMinusVoH = 1.0 - VoH;
+    float x2 = oneMinusVoH * oneMinusVoH;
+    float x5 = x2 * x2 * oneMinusVoH;
+    float3 F = F0 + (1.0 - F0) * x5;
+
+    // 5. 相关 Smith：G=2*NoL*NoV/q，G/(4*NoL*NoV)=0.5/q。
+    float rootV = sqrt(NoV * NoV * (1.0 - alpha2) + alpha2);
+    float rootL = sqrt(NoL * NoL * (1.0 - alpha2) + alpha2);
+    float q = max(NoL * rootV + NoV * rootL, 1e-7);
+    float visibility = 0.5 / q;
+    // 先约简再求值，避免极端掠射时先乘很小的 G 再除很小的分母。
     float3 specularBRDF = D * F * visibility;
 
-    // 第 5 步：给漫反射分配剩余能量，并排除纯金属漫反射。
+    // 6. 漫反射：近似分配剩余能量，金属不保留体漫反射。
     float3 kD = (1.0 - F) * (1.0 - metallic);
-    float3 diffuseBRDF = kD * baseColor / CPBR_PI;
+    float3 diffuseBRDF = kD * baseColor / PI;
 
-    // 第 6 步：从材质响应变成这盏灯的颜色贡献。
+    // 7. 渲染方程的单灯项：乘一次 NoL、光色、衰减和阴影。
     float attenuation = max(distanceAttenuation, 0.0) * saturate(shadowAttenuation);
     return (diffuseBRDF + specularBRDF) * max(lightColor, 0.0) * NoL * attenuation;
 }
 ```
 
-一般接入直接调用 `CPBR_EvaluateDirect`。如果要修改 D/F/G 的数学表达式，修改对应基础函数；如果要接灯光、贴图或改变坐标空间，查看 [06 的完整 Shader](06_Unity_URP_Implementation.md)。
+这两个版本用于展示“按公式拆成函数”和“在一个函数里展开运算”的对应关系，数学模型相同。接入 Unity 时，位置、纹理、灯光与阴影由引擎提供；材质的 DFG 和光照组合使用这里写出的实现，见 [06 的自包含完整 Shader](06_Unity_URP_Implementation.md)。

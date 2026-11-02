@@ -92,20 +92,92 @@ M 为样本数，`L_i(ω_j)` 是该方向的入射辐亮度；下标 i 表示 in
 
 多灯求和不能先把光方向相加再计算 BRDF，因为高光对方向的响应是非线性的；应对每个方向分别求值，再相加颜色。
 
-## 附：直接光求和代码
+## 附：将单光源计算完整展开后再求和
 
-下面假设材质、N、V 与两个 Light 已准备好，完整接口见 06：
+下面的函数把材质参数、GGX D、Schlick F、Smith G/V、Lambert 与灯光组合全部写在函数体内，不依赖其他自定义 BRDF 函数。`CPBR_Material` 只是三个输入参数组成的结构体，也在这里定义：
+
+```hlsl
+struct CPBR_Material
+{
+    float3 baseColor;
+    float metallic;
+    float perceptualRoughness;
+};
+
+float3 ExplainDirectPBR(
+    CPBR_Material material,
+    float3 normalWS, float3 viewDirWS, float3 lightDirWS,
+    float3 lightColor, float distanceAttenuation, float shadowAttenuation)
+{
+    // 1. 方向检查和归一化：这里只用 HLSL 数学指令。
+    float n2 = dot(normalWS, normalWS);
+    float v2 = dot(viewDirWS, viewDirWS);
+    float l2 = dot(lightDirWS, lightDirWS);
+    if (n2 < 1e-12 || v2 < 1e-12 || l2 < 1e-12)
+        return float3(0, 0, 0);
+    float3 N = normalWS * rsqrt(max(n2, 1e-12));
+    float3 V = viewDirWS * rsqrt(max(v2, 1e-12));
+    float3 L = lightDirWS * rsqrt(max(l2, 1e-12));
+    float NoL = saturate(dot(N, L));
+    float NoV = saturate(dot(N, V));
+    if (NoL <= 0.0 || NoV <= 0.0)
+        return float3(0, 0, 0);
+    float3 sumVL = V + L;
+    float h2 = dot(sumVL, sumVL);
+    if (h2 < 1e-12)
+        return float3(0, 0, 0);
+    float3 H = sumVL * rsqrt(max(h2, 1e-12));
+    float NoH = saturate(dot(N, H));
+    float VoH = saturate(dot(V, H));
+
+    // 2. 材质参数：感知粗糙度 r → alpha=r²，金属度 → RGB F0。
+    const float PI = 3.14159265358979323846;
+    float3 baseColor = saturate(material.baseColor);
+    float metallic = saturate(material.metallic);
+    float r = clamp(material.perceptualRoughness, 0.045, 1.0);
+    float alpha = r * r;
+    float alpha2 = alpha * alpha;
+    float3 F0 = (1.0 - metallic) * float3(0.04, 0.04, 0.04) + metallic * baseColor;
+
+    // 3. D：GGX 分布，完整写出分子和分母。
+    float NoH2 = NoH * NoH;
+    float d = (1.0 - NoH2) + NoH2 * alpha2;
+    float D = alpha2 / (PI * d * d);
+
+    // 4. F：Schlick，手工计算 (1-VoH)^5。
+    float oneMinusVoH = 1.0 - VoH;
+    float x2 = oneMinusVoH * oneMinusVoH;
+    float x5 = x2 * x2 * oneMinusVoH;
+    float3 F = F0 + (1.0 - F0) * x5;
+
+    // 5. 相关 Smith：G=2*NoL*NoV/q，G/(4*NoL*NoV)=0.5/q。
+    float rootV = sqrt(NoV * NoV * (1.0 - alpha2) + alpha2);
+    float rootL = sqrt(NoL * NoL * (1.0 - alpha2) + alpha2);
+    float q = max(NoL * rootV + NoV * rootL, 1e-7);
+    float visibility = 0.5 / q;
+    // 先约简再求值，避免极端掠射时先乘很小的 G 再除很小的分母。
+    float3 specularBRDF = D * F * visibility;
+
+    // 6. 漫反射：近似分配剩余能量，金属不保留体漫反射。
+    float3 kD = (1.0 - F) * (1.0 - metallic);
+    float3 diffuseBRDF = kD * baseColor / PI;
+
+    // 7. 渲染方程的单灯项：乘一次 NoL、光色、衰减和阴影。
+    float attenuation = max(distanceAttenuation, 0.0) * saturate(shadowAttenuation);
+    return (diffuseBRDF + specularBRDF) * max(lightColor, 0.0) * NoL * attenuation;
+}
+```
+
+在片元函数中，假设材质、N、V 与两个 Light 已准备好，使用刚才完整定义的函数分别计算再相加：
 
 ```hlsl
 float3 direct = float3(0, 0, 0);
-direct += CPBR_EvaluateDirect(material, N, V, light0.direction,
+direct += ExplainDirectPBR(material, N, V, light0.direction,
     light0.color, light0.distanceAttenuation, light0.shadowAttenuation);
-direct += CPBR_EvaluateDirect(material, N, V, light1.direction,
+direct += ExplainDirectPBR(material, N, V, light1.direction,
     light1.color, light1.distanceAttenuation, light1.shadowAttenuation);
 ```
 
-每次调用已经乘过 NoL、距离衰减和阴影，不要在求和后再乘一次。也不要除以灯光数量；额外光源本来就应该增加照明。
+每次求值已经乘过 NoL、距离衰减和阴影，不再在求和后乘一次，也不除以灯的数量。03 的正视条件下，一盏单位白光贡献约 0.356507，两盏同方向单位白光就约为 0.713014。
 
-例如 03 的正视条件下，一盏单位白光每通道约贡献 0.356507，两盏相同方向的单位白光就约为 0.713014。
-
-自发光只在求和后加入一次。线性 HDR 可以大于 1，不应在光照函数末尾直接 `saturate(color)`，否则会截掉曝光和色调映射需要的信息。
+自发光只在求和后加入一次。线性 HDR 可以大于 1，不应直接 `saturate(color)`，以免截掉显示处理需要的信息。这里仍未实现 IBL 的预过滤、LUT 生成与环境采样；前面的 IBL 公式用于解释组成，不用一个未定义函数冒充完整实现。

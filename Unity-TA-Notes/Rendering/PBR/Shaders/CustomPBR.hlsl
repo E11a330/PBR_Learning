@@ -1,4 +1,4 @@
-// 用法：准备材质、N/V/L 和 Light 数据，调用 CPBR_EvaluateDirect 得到一盏灯的颜色。
+// 手写实现：下方依次给出参数转换、D、F、G、visibility、BRDF 与单灯组合的完整函数体。
 // 所有颜色按线性 RGB 计算；这里使用 GGX D + Schlick F + 高度相关 Smith G。
 // 本文件不依赖 Unity 头文件；完整接线见 ../06_Unity_URP_Implementation.md。
 // 阅读顺序：材质参数 → alpha/F0 → 几何点乘 → D/F/visibility → BRDF → 单灯贡献。
@@ -17,12 +17,6 @@ struct CPBR_Material
     float perceptualRoughness;    // 面板上的粗糙度 r；不要预先平方。
 };
 
-float CPBR_Pow5(float x)
-{
-    float x2 = x * x;
-    return x2 * x2 * x;
-}
-
 float3 CPBR_SafeNormalize(float3 value)
 {
     // 防止零向量归一化出错；光照入口还会拒绝无效方向。
@@ -38,7 +32,10 @@ float CPBR_RoughnessToAlpha(float perceptualRoughness)
 
 float3 CPBR_F0(float3 baseColor, float metallic)
 {
-    return lerp(float3(0.04, 0.04, 0.04), saturate(baseColor), saturate(metallic));
+    float3 color = saturate(baseColor);
+    float m = saturate(metallic);
+    // F0=(1-m)*0.04+m*baseColor，每个颜色通道独立计算。
+    return (1.0 - m) * float3(0.04, 0.04, 0.04) + m * color;
 }
 
 float CPBR_DistributionGGX(float NoH, float alpha)
@@ -56,7 +53,11 @@ float CPBR_DistributionGGX(float NoH, float alpha)
 float3 CPBR_FresnelSchlick(float VoH, float3 F0)
 {
     // F：直接微表面反射使用 V·H；F0 与返回值均是 RGB。
-    return F0 + (1.0 - F0) * CPBR_Pow5(1.0 - saturate(VoH));
+    float x = 1.0 - saturate(VoH);
+    float x2 = x * x;
+    float x5 = x2 * x2 * x;
+    // F=F0+(1-F0)*(1-VoH)^5。
+    return F0 + (1.0 - F0) * x5;
 }
 
 float CPBR_VisibilitySmithGGXCorrelated(float NoL, float NoV, float alpha)
@@ -77,10 +78,19 @@ float CPBR_VisibilitySmithGGXCorrelated(float NoL, float NoV, float alpha)
 
 float CPBR_GeometrySmithGGXCorrelated(float NoL, float NoV, float alpha)
 {
-    // 只想看 G 时用这个；正式组合镜面项时直接使用 visibility。
-    // 由受保护的 visibility 还原，极端角度会继承其分母下限近似。
-    return 4.0 * saturate(NoL) * saturate(NoV)
-        * CPBR_VisibilitySmithGGXCorrelated(NoL, NoV, alpha);
+    // 独立实现 G，不通过调用 visibility 再反推。
+    NoL = saturate(NoL);
+    NoV = saturate(NoV);
+    if (NoL <= 0.0 || NoV <= 0.0)
+        return 0.0;
+    alpha = clamp(alpha, CPBR_MIN_ROUGHNESS * CPBR_MIN_ROUGHNESS, 1.0);
+    float alpha2 = alpha * alpha;
+    float rootV = sqrt(NoV * NoV * (1.0 - alpha2) + alpha2);
+    float rootL = sqrt(NoL * NoL * (1.0 - alpha2) + alpha2);
+    float denominator = NoL * rootV + NoV * rootL;
+    // G=2*NoL*NoV/denominator，等价于高度相关 Smith 的 Lambda 形式。
+    // 与 visibility 使用同一分母下限，使两种组合在极端角度保持同一近似。
+    return (2.0 * NoL * NoV) / max(denominator, CPBR_VISIBILITY_EPSILON);
 }
 
 void CPBR_EvaluateBRDF(
