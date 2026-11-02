@@ -73,12 +73,15 @@ Unity-TA-Notes/
 
 ## 参考资料与验证范围
 
-笔记为重新编写的中文解释，并非原对话逐字转录。资料核对日期：2026-11-01。
+笔记为重新编写的中文解释，并非原对话逐字转录。最近校正日期：2026-11-03。
 
 - [PBRT 第 4 版：微表面理论](https://www.pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory)
+- [PBRT 第 4 版：蒙特卡洛积分与概率密度](https://www.pbr-book.org/4ed/Monte_Carlo_Integration/Monte_Carlo_Basics)
 - [Filament：材质与光照模型](https://google.github.io/filament/main/filament.html)
 - [Unity URP 14：灯光接口](https://docs.unity3d.com/Packages/com.unity.render-pipelines.universal@14.0/manual/use-built-in-shader-methods-lighting.html)、[纹理采样](https://docs.unity3d.com/Packages/com.unity.render-pipelines.universal@14.0/manual/writing-shaders-urp-unlit-texture.html)
 - Unity 源码：[BRDF.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.universal/ShaderLibrary/BRDF.hlsl)、[Lighting.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl)、[RealtimeLights.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.universal/ShaderLibrary/RealtimeLights.hlsl)
 - Unity 源码：[SpaceTransforms.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.core/ShaderLibrary/SpaceTransforms.hlsl)、[Packing.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.core/ShaderLibrary/Packing.hlsl)
 
 文件层级、编码与相对链接已检查；HLSL 函数库、展开函数、调试函数通过独立编译，另有公式数值核对。完整示例的顶点/片元代码也用独立接口替身做了语法检查；这不等于真实 URP 编译。尚未在 Unity Editor 中导入、运行或比较画面。Unity 维护分支会变化，实际接入以本地包版本为准。
+
+本次校正覆盖所有笔记和 HLSL：澄清 BRDF 与方向辐照度、NDF 与 PDF、环境照明与间接光的区别，统一采样公式的符号和 split-sum 的 F90 约定，并补充与 URP/Lit 的 π 因子差异。完整示例同时补上主光阴影距离淡出及退化切线回退。

@@ -78,6 +78,7 @@ float CPBR_VisibilitySmithGGXCorrelated(float NoL, float NoV, float alpha)
 float CPBR_GeometrySmithGGXCorrelated(float NoL, float NoV, float alpha)
 {
     // 只想看 G 时用这个；正式组合镜面项时直接使用 visibility。
+    // 由受保护的 visibility 还原，极端角度会继承其分母下限近似。
     return 4.0 * saturate(NoL) * saturate(NoV)
         * CPBR_VisibilitySmithGGXCorrelated(NoL, NoV, alpha);
 }

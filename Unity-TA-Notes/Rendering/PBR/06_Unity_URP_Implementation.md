@@ -26,7 +26,7 @@ $$N=\operatorname{normalize}(n_xT+n_yB+n_zN_g)$$
 
 Ng 是网格法线，T 是切线，B 是副切线。平坦法线 `(0,0,1)` 会得到 Ng；x/y 分量则让法线朝表面切线方向偏转。
 
-实现中将插值后的 T 对 Ng 重新正交化，再用 `cross(Ng,T)*sign` 得到 B。sign 包含切线手性与奇数次负缩放符号，避免镜像方向翻转。模型需要有有效 UV、法线与切线。
+实现中将插值后的 T 对 Ng 重新正交化，再用 `cross(Ng,T)*sign` 得到 B。sign 包含切线手性与奇数次负缩放符号，避免镜像方向翻转。退化切线会回退到网格法线，避免无效归一化；模型仍应提供正确的 UV、法线与切线。
 
 ## 3. 材质数据怎样进入公式
 
@@ -52,7 +52,15 @@ ORM.R 是 AO；当前只计算直接光，因此不将它乘到最终颜色。�
 
 主光通过世界位置生成阴影坐标后读取；附加光逐盏读取，再用同一套 BRDF 求值。调用 `CPBR_EvaluateDirect` 得到的是最终单灯贡献，已包括 NoL 和衰减，不能再次相乘。
 
+主光使用 `GetMainLight(shadowCoord, positionWS, shadowMask)` 重载，让引擎计算实时阴影的距离淡出。当前没有烘焙 Shadowmask，传入全白遮罩；仅传 shadowCoord 的重载只采实时阴影，不执行同一套距离淡出组合。接口可对照 [RealtimeLights.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.universal/ShaderLibrary/RealtimeLights.hlsl) 与 [Shadows.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl)。
+
 这里面向 **Unity 2022.3 / URP 14 / Forward / Linear**，附加光使用 Per Pixel。Forward+ 有不同的灯光遍历要求，不能只照搬普通附加光循环。
+
+### 与 URP/Lit 比较时的 π 因子约定
+
+本例保留教科书 BRDF 的显式 `/π`。URP 14 的 `BRDFData.diffuse` 则将漫反射颜色和反射率权重打包后直接用于灯光组合，该项没有再写 `/π`。因此，即使输入相同，拿两段代码直接比较漫反射亮度，也会混入这一归一化约定的差别；本例角度相关的 `(1-F)` 权重又与 Lit 的权重不同。
+
+不要为追齐 Lit 截图而随意改 F0、只删除一个分量的 `/π` 或重复增大灯强。若目标是数值匹配 Lit，应将它的材质初始化、直接镜面近似、灯光归一化与环境光组合一起移植。对照入口为 [BRDF.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.universal/ShaderLibrary/BRDF.hlsl) 和 [Lighting.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl)。本例不声明灯强经过与 Lit 相同的物理标定。
 
 ## 5. 调试与实现边界
 
@@ -216,7 +224,7 @@ float4 DebugPBR(CPBR_Material material, float3 N, float3 V, Light light, int mod
                 float3 baseSample = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uv).rgb;
                 float3 orm = SAMPLE_TEXTURE2D(_ORMMap, sampler_ORMMap, uv).rgb;
                 CPBR_Material material;
-                material.baseColor = baseSample * _BaseColor.rgb;
+                material.baseColor = saturate(baseSample * _BaseColor.rgb);
                 material.metallic = saturate(orm.b * _Metallic);
                 material.perceptualRoughness = clamp(orm.g * _Roughness, 0.045, 1.0);
                 // orm.r 留给将来的间接光遮蔽；本示例不把它乘到直接光上。
@@ -224,14 +232,21 @@ float4 DebugPBR(CPBR_Material material, float3 N, float3 V, Light light, int mod
                 // 2. 将法线贴图提供的偏转，换成世界空间方向。
                 float4 packedNormal = SAMPLE_TEXTURE2D(_BumpMap, sampler_BumpMap, uv);
                 float3 normalTS = UnpackNormalScale(packedNormal, _NormalScale);
-                float3 Ng = normalize(input.normalWS);
-                float3 T = normalize(input.tangentWS.xyz - Ng * dot(Ng, input.tangentWS.xyz));
-                float3 B = cross(Ng, T) * input.tangentWS.w;
-                float3 N = normalize(normalTS.x * T + normalTS.y * B + normalTS.z * Ng);
+                float3 Ng = CPBR_SafeNormalize(input.normalWS);
+                float3 tangent = input.tangentWS.xyz - Ng * dot(Ng, input.tangentWS.xyz);
+                float tangentLengthSq = dot(tangent, tangent);
+                float3 N = Ng; // 缺失/退化切线时保留网格法线。
+                if (tangentLengthSq > 1e-8)
+                {
+                    float3 T = tangent * rsqrt(tangentLengthSq);
+                    float3 B = cross(Ng, T) * input.tangentWS.w;
+                    N = CPBR_SafeNormalize(normalTS.x * T + normalTS.y * B + normalTS.z * Ng);
+                }
                 float3 V = GetWorldSpaceNormalizeViewDir(input.positionWS);
 
                 // 3. 获取主光和主光阴影。
-                Light mainLight = GetMainLight(TransformWorldToShadowCoord(input.positionWS));
+                float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS);
+                Light mainLight = GetMainLight(shadowCoord, input.positionWS, half4(1,1,1,1));
 
                 // 调试模式直接返回，不叠加雾或其他灯光。
                 int mode = (int)_DebugMode;

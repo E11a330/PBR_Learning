@@ -25,15 +25,17 @@ $$
 
 实时渲染常用：
 
-$$C_{direct}=\sum_j(f_d+f_s)\,C_j\,NoL_j\,A_j\,S_j$$
+$$C_{direct}=\sum_j[f_d(L_j,V)+f_s(L_j,V)]\,C_j\,NoL_j\,A_j\,S_j$$
 
 `Cj` 包含光色与强度，`Aj` 包含距离/聚光衰减，`Sj` 为阴影因子。点光源在理想情况下随距离平方反比衰减，游戏引擎还会增加光源范围的平滑截断。
 
 在 URP 中，若已经使用 `Light.distanceAttenuation`，不要自己再乘一次 `1/distance²`。`Light.shadowAttenuation` 也只在最终计算中使用一次。参见 [Unity Lighting.hlsl](https://github.com/Unity-Technologies/Graphics/blob/2022.3/staging/Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl) 中组合光照项的位置。
 
-## 间接光：不能只看当前灯
+## 环境与间接光：不能只看当前灯
 
-间接光包括来自其他表面的反弹以及环境照明。实时方法通常混用光照贴图、光照探针、反射探针、屏幕空间技术等，而非实时解完整积分。
+间接光指经过其他表面反弹后到达当前表面的光。环境图则是入射方向光照的表示：天空直接照到表面时，物理上属于直接照明；环境图也可以包含周围物体反射的结果。因此 IBL 不等同于“已经反弹过的间接光”。
+
+实时引擎经常将环境照明与 GI 放在相近的计算模块处理。这里将它们一起讨论，是实现上的组织方式；具体仍可能混用光照贴图、光照探针、反射探针和屏幕空间方法，而非实时解完整积分。
 
 IBL（Image-Based Lighting）用环境图代表从不同方向来的光。纯金属没有体漫反射；若只实现直接光而无环境镜面反射，很多朝向会很暗。
 
@@ -49,9 +51,9 @@ $$E(N)=\int_{\Omega^+}L_i(L)(N\cdot L)\,d\omega_L,\quad L_{diffuse}=\frac{c_d}{\
 
 常见近似把环境预过滤与 BRDF 积分拆开：
 
-$$L_{specular}\approx prefilteredEnv(R,r)\,[F_0 A(NoV,r)+B(NoV,r)]$$
+$$L_{specular}\approx prefilteredEnv(R,r)\,[F_0 A(NoV,r)+F_{90}B(NoV,r)]$$
 
-其中 `R=reflect(-V,N)`，`A/B` 来自 BRDF 积分查找表。这是结构示意；实际引擎可能采用解析拟合、不同 F90 或能量补偿。
+其中 `R=reflect(-V,N)`，`A/B` 是从 Schlick Fresnel 的两个系数得到的 BRDF 积分项。本笔记使用 `F90=1` 时才可简写为 `F0*A+B`。这是 split-sum 的结构示意；实际引擎可能采用解析拟合、不同参数化或能量补偿，不能脱离对应实现只替换这一行。
 
 环境预过滤、粗糙度到 mip 的映射、采样分布和 BRDF LUT 必须配套。不能把任意模糊 cubemap 直接乘当前直接光的 `D*F*G`，也不能再给 IBL 乘某个单独方向的 `NoL`。
 
@@ -59,21 +61,23 @@ $$L_{specular}\approx prefilteredEnv(R,r)\,[F_0 A(NoV,r)+B(NoV,r)]$$
 
 ## 补充：从积分到采样
 
-若按概率密度 `p(L)` 采样半球，蒙特卡洛估计为：
+若按方向概率密度 `p(ω)` 采样半球，用 `ω_j` 表示第 j 个入射样本方向，蒙特卡洛估计为：
 
-$$L_o-L_e\approx\frac{1}{M}\sum_{i=1}^{M}\frac{f_r(L_i,V)L_i(L_i)(N\cdot L_i)}{p(L_i)}$$
+$$L_o-L_e\approx\frac{1}{M}\sum_{j=1}^{M}\frac{f_r(\omega_j,V)\,L_i(\omega_j)\,\max(N\cdot\omega_j,0)}{p(\omega_j)}$$
 
-分母 PDF 不能漏，且必须使用方向域中的正确 PDF。对微表面法线 H 的采样密度，转换为反射方向 L 的密度还涉及 Jacobian，不能直接混用。这也是只抄 BRDF、却随便采环境图会出错的原因。
+M 为样本数，`L_i(ω_j)` 是该方向的入射辐亮度；下标 i 表示 incoming，与样本编号 j 分开。PDF 按立体角定义，并应在被积函数非零的区域有非零采样概率。推导与条件可对照 [PBRT 蒙特卡洛积分](https://www.pbr-book.org/4ed/Monte_Carlo_Integration/Monte_Carlo_Basics)。
+
+分母 PDF 不能漏。普通 NDF 采样用 `p_H(H)=D(H)·NoH` 时，镜面反射方向的 PDF 为 `p_L(L)=p_H(H)/(4|V·H|)`；若改用可见法线采样，就要从它自己的 `p_H` 转换，不能继续套普通 NDF 的 PDF。这里只解释积分权重，不提供完整的 IBL 预计算实现。
 
 ## 直接光、间接光与输出
 
 ```text
-最终线性 HDR = 直接漫反射 + 直接镜面
-             + 间接漫反射 + 间接镜面 + 自发光
+最终线性 HDR = 显式实时灯的漫反射 + 显式实时灯的镜面
+             + 其余环境/GI 的漫反射与镜面 + 自发光
 显示结果     = 曝光 / 色调映射 / 显示编码等输出处理
 ```
 
-配套 HLSL 只实现第一行中的两个直接光分量。为了观察公式，它不自动补环境亮度，也不输出已经 Gamma 编码的颜色。
+这里按实现模块分组，环境/GI 分量可能包含物理上的直接或间接照明。配套 HLSL 只实现显式实时灯的两个直接光分量。它不自动补环境亮度，也不输出已经 Gamma 编码的颜色。
 
 ## 将公式安排到执行流程
 

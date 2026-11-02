@@ -20,6 +20,8 @@
 
 尽量使用不含烘焙高光和定向阴影的 Base Color 贴图，否则实时灯光会再叠加一次明暗。
 
+本例把反射用的线性 Base Color 夹到 `[0,1]`；这不适用于自发光。需要超过 1 的 HDR 发光颜色时，应走独立的 Emission 路径，不要塞进反照率或 F0。
+
 ## 金属度不是「反光强度」
 
 干净、均一的材质区域通常接近 0 或 1。中间值可来自纹理过滤、覆盖混合或美术近似；它不表示「导电率 50%」。油漆覆盖的金属，在可见涂层处主要呈现非金属响应；生锈区域也不宜因底材是铁就全设为 1。
@@ -53,6 +55,8 @@ ORM（R=AO、G=Roughness、B=Metallic）是另一种常见打包约定，不等�
 
 切线空间法线需要通过 TBN 转到世界空间，再与世界空间 L、V 点乘。处理好模型切线的符号、负缩放和插值后的归一化。06 的完整示例已包含这条接线；使用默认平坦法线时，结果接近原来的网格法线。
 
+TBN 只负责方向变换，不能保证任意法线贴图都严格守恒，也不会改变几何轮廓或 Shadow Map 的几何可见性。强法线在明暗交界处出现问题时，需要区分着色法线与几何法线。示例对缺失/退化切线回退到网格法线，避免归一化零切线产生无效值；它不能代替正确的切线导入。
+
 ## AO 的位置
 
 AO 主要近似未解析几何对间接光的遮挡，不应不加区分地把所有直接高光乘暗。镜面环境遮蔽也通常需要不同处理。配套直接光函数不接收 AO；未来加入间接光后再按光照分量应用。
@@ -82,7 +86,7 @@ float3 sampledBase = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, uv).rgb;
 float3 orm = SAMPLE_TEXTURE2D(_ORMMap, sampler_ORMMap, uv).rgb;
 
 CPBR_Material material;
-material.baseColor = sampledBase * _BaseColor.rgb;
+material.baseColor = saturate(sampledBase * _BaseColor.rgb);
 material.metallic = saturate(orm.b * _Metallic);
 material.perceptualRoughness = clamp(orm.g * _Roughness, 0.045, 1.0);
 // orm.r 留给间接光遮蔽；当前示例只实现直接光。
